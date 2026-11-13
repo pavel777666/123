@@ -1,0 +1,409 @@
+"""
+Telegram-бот для скачивания видео с YouTube, TikTok, Instagram.
+Автоскачивание в 720p, база данных подписчиков, проверка подписки.
+Установка:
+pip install aiogram yt-dlp
+# также нужен ffmpeg: sudo apt install ffmpeg  (Ubuntu) или winget install ffmpeg (Windows)
+Запуск:
+python bot.py
+"""
+import asyncio
+import os
+import re
+import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor
+import yt_dlp
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.filters import Command
+from aiogram.types import (
+BotCommand, CallbackQuery, FSInputFile,
+InlineKeyboardButton, InlineKeyboardMarkup, Message,
+)
+
+
+
+
+
+#==================== НАСТРОЙКИ ====================
+BOT_TOKEN = "9111988543:AAEjVCgUQisxIej2w7qubpMkhYNZ_B_afx0"    # токен от @BotFather
+CHANNEL = "-1003811279882"                   # @username канала или числовой ID вида -100...
+ADMIN_IDS = {-1003811279882}                     # ваши Telegram ID (узнать: @userinfobot)
+DB_PATH = "users.db"
+DOWNLOAD_DIR = "downloads"
+COOKIE_FILE = "cookies.txt"                 # cookies для Instagram/YouTube (Netscape-формат)
+DEFAULT_QUALITY = 720                       # качество по умолчанию
+MAX_FILE_MB = 49                            # лимит обычного Bot API — 50 МБ
+RATE_LIMIT = 5                              # скачиваний в минуту на пользователя
+LINK_TTL = 600                              # сколько секунд живёт выбранная ссылка
+
+
+#===================================================
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+executor = ThreadPoolExecutor(max_workers=4)
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+URL_RE = re.compile(
+r"https?://(?:www.|vm.|vt.)?"
+r"(?:youtube.com|youtu.be|tiktok.com|instagram.com)\S+"
+)
+
+
+
+
+
+#---------------- База данных ----------------
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id     INTEGER PRIMARY KEY,
+            username    TEXT,
+            full_name   TEXT,
+            subscribed  INTEGER DEFAULT 0,
+            downloads   INTEGER DEFAULT 0,
+            first_seen  TEXT,
+            last_seen   TEXT
+         )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id   INTEGER,
+            platform  TEXT,
+            quality   TEXT,
+            size_mb   REAL,
+            status    TEXT,
+            ts        TEXT DEFAULT (datetime('now', 'localtime'))
+        )
+    """)
+    return conn
+
+def upsert_user(user, subscribed: int):
+    with db() as c:
+        c.execute("""
+        INSERT INTO users (user_id, username, full_name, subscribed,
+                            first_seen, last_seen)
+        VALUES (?, ?, ?, ?, datetime('now','localtime'), datetime('now','localtime'))
+        ON CONFLICT(user_id) DO UPDATE SET
+            username = excluded.username,
+            full_name = excluded.full_name,
+            subscribed = excluded.subscribed,
+            last_seen = datetime('now','localtime')
+    """, (user.id, user.username or "", user.full_name, subscribed))
+        
+def log_action(user_id: int, platform: str, quality: str, size_mb: float, status: str):
+    with db() as c:
+        c.execute(
+            "INSERT INTO logs (user_id, platform, quality, size_mb, status) VALUES (?,?,?,?,?)",
+            (user_id, platform, quality, size_mb, status),
+        )
+        if status == "ok":
+            c.execute("UPDATE users SET downloads = downloads + 1 WHERE user_id = ?", (user_id,))
+
+
+
+
+            
+#---------------- Подписка ----------------
+OK_STATUS = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
+
+async def is_subscribed(user_id: int) -> bool:
+    try:    
+        member = await bot.get_chat_member(CHANNEL, user_id)
+        return member.status in OK_STATUS
+    except Exception:
+        return False
+    
+def sub_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    if CHANNEL.startswith("@"):
+        rows.append([InlineKeyboardButton(
+            text="📢 Подписаться", url=f"https://t.me/{CHANNEL.lstrip('@')}"
+        )])
+
+    rows.append([InlineKeyboardButton(text="✅ Я подписался — проверить", callback_data="check_sub")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+quality_kb = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="⚡ 720p (по умолчанию)", callback_data="q:720")],
+    [InlineKeyboardButton(text="360p", callback_data="q:360"),
+     InlineKeyboardButton(text="480p", callback_data="q:480"),
+     InlineKeyboardButton(text="1080p", callback_data="q:1080")],
+])
+
+
+
+
+
+#---------------- Состояния ----------------
+user_mode: dict[int, str | None] = {}   # None = авто 720p, "choose" = выбор качества
+pending: dict[int, tuple[str, float]] = {}   # user_id -> (url, время)
+last_links: dict[int, str] = {}         # для /again
+rate: dict[int, list[float]] = {}       # антиспам
+
+def platform_of(url: str) -> str:
+    if "tiktok" in url: return "TikTok"
+    if "instagram" in url: return "Instagram"
+    return "YouTube"
+
+def rate_ok(user_id: int) -> bool:
+    now = time.time()
+    window = [t for t in rate.get(user_id, []) if now - t < 60]
+    if len(window) >= RATE_LIMIT:
+        rate[user_id] = window
+        return False
+    window.append(now)
+    rate[user_id] = window
+    return True
+
+
+
+
+
+#---------------- Скачивание ----------------
+def build_opts(quality: int, progress_cb=None) -> dict:
+    opts = {
+        "format": (
+            f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]"
+            f"/best[height<={quality}][ext=mp4]/best[height<={quality}]/best"
+        ),
+        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 3,
+        "socket_timeout": 30,
+        "concurrent_fragment_downloads": 8,   # скорость: параллельная загрузка
+        "http_chunk_size": 10485760,
+    }
+
+    if os.path.exists(COOKIE_FILE):
+        opts["cookiefile"] = COOKIE_FILE
+    if progress_cb:
+        def hook(d):
+            if d["status"] == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
+                progress_cb(int((d.get("downloaded_bytes") or 0) / total * 100))
+        opts["progress_hooks"] = [hook]
+    return opts
+
+def download_sync(url: str, quality: int, progress_cb=None) -> str:
+    with yt_dlp.YoutubeDL(build_opts(quality, progress_cb)) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if "entries" in info:
+            info = info["entries"][0]
+        return info["requested_downloads"][0]["filepath"]
+
+async def process(message: Message, url: str, quality: int):
+    user_id = message.from_user.id
+    platform = platform_of(url)
+
+    if not rate_ok(user_id):
+        await message.answer(f"Слишком много запросов — максимум {RATE_LIMIT} в минуту 🙂")
+        return
+
+    status = await message.answer("⏳ Скачиваю… 0%")
+    last_pct = {"v": -1}
+
+    def progress(pct):
+        if pct >= last_pct["v"] + 20:
+            last_pct["v"] = pct
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    status.edit_text(f"⏳ Скачиваю… {pct}%"), loop
+                )
+            except Exception:
+                pass
+
+    loop = asyncio.get_running_loop()
+    path = None
+    try:
+        path = await loop.run_in_executor(executor, download_sync, url, quality, progress)
+        size_mb = os.path.getsize(path) / 1048576
+
+        if size_mb > MAX_FILE_MB:
+            await status.edit_text(
+                f"Файл весит {size_mb:.0f} МБ — больше лимита Telegram (50 МБ). "
+                "Попробуй качество пониже."
+            )
+            log_action(user_id, platform, str(quality), size_mb, "too_big")
+        else:
+            await status.edit_text("📤 Отправляю…")
+            await message.answer_video(
+                FSInputFile(path),
+                caption=f"{platform} · {quality}p · {size_mb:.1f} МБ",
+            )
+            last_links[user_id] = url
+            log_action(user_id, platform, str(quality), size_mb, "ok")
+            await status.delete()
+    except yt_dlp.utils.DownloadError as e:
+        msg = str(e)
+        if "Sign in" in msg or "LOGIN_REQUIRED" in msg:
+            await status.edit_text("YouTube требует авторизацию — обновите cookies.txt.")
+        elif "login" in msg.lower() or "401" in msg:
+            await status.edit_text("Instagram требует свежие cookies — обновите cookies.txt.")
+        else:
+            await status.edit_text(f"Не удалось скачать 😕\n{msg[:200]}")
+        log_action(user_id, platform, str(quality), 0, "fail")
+    except Exception as e:
+        await status.edit_text(f"Ошибка: {e}")
+        log_action(user_id, platform, str(quality), 0, "fail")
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
+
+
+
+#---------------- Хендлеры ----------------
+@dp.message(Command("start"))
+async def start(message: Message):
+    if await is_subscribed(message.from_user.id):
+        upsert_user(message.from_user, 1)
+        await message.answer(
+            "Привет! Кидай ссылку на видео с YouTube, TikTok или Instagram — "
+            f"скачаю автоматически в {DEFAULT_QUALITY}p.\n\n"
+            "Команды:\n"
+            "/quality — выбор качества для следующего видео\n"
+            "/auto — вернуть автокачание в 720p\n"
+            "/again — перекачать последнее видео\n"
+            "/help — вся справка"
+        )
+    else:
+        upsert_user(message.from_user, 0)
+        await message.answer(
+            "Чтобы качать видео, подпишись на канал и нажми кнопку проверки 👇",
+            reply_markup=sub_keyboard(),
+        )
+
+@dp.callback_query(F.data == "check_sub")
+async def check_sub(cb: CallbackQuery):
+    if await is_subscribed(cb.from_user.id):
+        upsert_user(cb.from_user, 1)
+        await cb.message.edit_text("✅ Подписка подтверждена! Кидай ссылку на видео.")
+        await cb.answer()
+    else:
+        await cb.answer("Подписка не найдена. Подпишись и нажми кнопку снова.", show_alert=True)
+
+@dp.message(Command("help"))
+async def help_cmd(message: Message):
+    await message.answer(
+        "📌 Как пользоваться:\n"
+        "1. Подпишись на канал (если ещё не).\n"
+        "2. Кинь ссылку на видео — получишь его в 720p.\n\n"
+        "Команды:\n"
+        "/quality — показать выбор качества (360/480/720/1080)\n"
+        "/auto — вернуть автоматический режим 720p\n"
+        "/again — перекачать последнее видео\n"
+        "/myid — узнать свой ID\n\n"
+        f"Лимит: {RATE_LIMIT} скачиваний в минуту."
+    )
+
+@dp.message(Command("myid"))
+async def myid(message: Message):
+    await message.answer(f"Твой ID: <code>{message.from_user.id}</code>")
+
+@dp.message(Command("quality"))
+async def quality_cmd(message: Message):
+    user_mode[message.from_user.id] = "choose"
+    await message.answer(
+        "Теперь для каждой ссылки я буду показывать выбор качества:",
+        reply_markup=quality_kb,
+    )
+
+@dp.message(Command("auto"))
+async def auto_cmd(message: Message):
+    user_mode[message.from_user.id] = None
+    await message.answer(f"Автоматический режим: всё качается в {DEFAULT_QUALITY}p сразу.")
+
+@dp.message(Command("again"))
+async def again_cmd(message: Message):
+    url = last_links.get(message.from_user.id)
+    if not url:
+        await message.answer("Ты пока не качал ни одного видео.")
+        return
+    if not await is_subscribed(message.from_user.id):
+        await message.answer("Сначала подпишись на канал 👇", reply_markup=sub_keyboard())
+        return
+    await process(message, url, DEFAULT_QUALITY)
+
+@dp.message(Command("stats"))
+async def stats_cmd(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("Команда только для админа.")
+        return
+    with db() as c:
+        total, subs = c.execute(
+            "SELECT COUNT(), COALESCE(SUM(subscribed),0) FROM users"
+        ).fetchone()
+        dl, ok = c.execute(
+            "SELECT COUNT(), COALESCE(SUM(status='ok'),0) FROM logs"
+        ).fetchone()
+        top = c.execute(
+            "SELECT platform, COUNT(*) FROM logs GROUP BY platform ORDER BY 2 DESC"
+        ).fetchall()
+    lines = [
+        f"👤 Пользователей: {total} (подписаны: {subs})",
+        f"⬇️ Скачиваний: {dl} (успешных: {ok})",
+    ]
+    lines += [f"  {p}: {n}" for p, n in top]
+    await message.answer("\n".join(lines))
+
+@dp.message(F.text.regexp(URL_RE))
+async def on_link(message: Message):
+    user_id = message.from_user.id
+    if not await is_subscribed(user_id):
+        upsert_user(message.from_user, 0)
+        await message.answer("Сначала подпишись на канал 👇", reply_markup=sub_keyboard())
+        return
+
+    upsert_user(message.from_user, 1)
+    url = URL_RE.search(message.text).group(0)
+
+    if user_mode.get(user_id) == "choose":
+        pending[user_id] = (url, time.time())
+        await message.answer("Выбери качество:", reply_markup=quality_kb)
+    else:
+        await process(message, url, DEFAULT_QUALITY)  # авто-режим: сразу 720p
+
+@dp.callback_query(F.data.startswith("q:"))
+async def pick_quality(cb: CallbackQuery):
+    quality = int(cb.data.split(":")[1])
+    entry = pending.pop(cb.from_user.id, None)
+    if not entry:
+        await cb.answer("Сначала пришли ссылку 🙂", show_alert=True)
+        return
+    url, ts = entry
+    if time.time() - ts > LINK_TTL:
+        await cb.answer("Слишком долго выбирал — пришли ссылку заново.", show_alert=True)
+        return
+    await cb.answer()
+    await process(cb.message, url, quality)
+
+@dp.message()
+async def fallback(message: Message):
+    await message.answer("Пришли ссылку на видео с YouTube, TikTok или Instagram.")
+
+
+
+
+#---------------- Запуск ----------------
+async def main():
+    db().close()
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Начать"),
+        BotCommand(command="help", description="Как пользоваться"),
+        BotCommand(command="quality", description="Выбрать качество"),
+        BotCommand(command="auto", description="Автокачание 720p"),
+        BotCommand(command="again", description="Перекачать последнее"),
+        BotCommand(command="stats", description="Статистика (админ)"),
+    ])
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
